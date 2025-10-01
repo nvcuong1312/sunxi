@@ -1,0 +1,44 @@
+name: Build A133P Kernel Modules
+
+on: [workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup A133P toolchain
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc-aarch64-linux-gnu
+        
+    - name: Clone Allwinner kernel
+      run: |
+        git clone https://github.com/tinalinux/linux -b master linux-tina
+        cd linux-tina
+        make sun50iw10p1_defconfig ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+        
+    - name: Build sunxi-btlpm
+      run: |
+        mkdir -p output
+        cat > sunxi-btlpm.c << 'EOF'
+        [DÙNG SOURCE CODE Ở TRÊN]
+        EOF
+        
+        cat > Makefile << 'EOF'
+        obj-m += sunxi-btlpm.o
+        KDIR := ../linux-tina
+        all:
+        	$(MAKE) -C $(KDIR) M=$(PWD) modules ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+        EOF
+        
+        make
+        cp sunxi-btlpm.ko output/
+        
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: a133p-kernel-modules
+        path: output/
