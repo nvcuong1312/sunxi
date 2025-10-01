@@ -1,0 +1,162 @@
+name: Build sunxi-btlpm kernel module
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:  # Cho phép chạy thủ công
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        kernel-version: ["5.16.17", "5.15.89", "5.10.110"]
+        arch: [arm64]
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup cross-compilation environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          gcc-aarch64-linux-gnu \
+          git build-essential \
+          libssl-dev bc flex bison \
+          wget
+
+    - name: Download Allwinner kernel source
+      run: |
+        wget https://github.com/tinalinux/linux/archive/refs/heads/master.zip -O kernel.zip
+        unzip kernel.zip
+        mv linux-master linux-sunxi
+
+    - name: Configure kernel for A133P
+      run: |
+        cd linux-sunxi
+        export ARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        make sun50iw10p1_defconfig
+        make modules_prepare
+
+    - name: Create sunxi-btlpm source
+      run: |
+        mkdir -p sunxi-btlpm
+        cat > sunxi-btlpm/sunxi-btlpm.c << 'EOF'
+        #include <linux/module.h>
+        #include <linux/kernel.h>
+        #include <linux/init.h>
+        #include <linux/gpio.h>
+        #include <linux/of_gpio.h>
+        #include <linux/delay.h>
+        #include <linux/platform_device.h>
+
+        static int power_gpio = -1;
+        static int reset_gpio = -1;
+
+        static int sunxi_btlpm_probe(struct platform_device *pdev)
+        {
+            struct device *dev = &pdev->dev;
+            struct device_node *np = dev->of_node;
+            
+            printk(KERN_INFO "sunxi-btlpm: Probing XR829 Bluetooth PM\\n");
+            
+            power_gpio = of_get_named_gpio(np, "bt_power", 0);
+            if (gpio_is_valid(power_gpio)) {
+                if (devm_gpio_request(dev, power_gpio, "bt_power") == 0) {
+                    gpio_direction_output(power_gpio, 1);
+                    msleep(100);
+                    printk(KERN_INFO "sunxi-btlpm: BT power GPIO %d enabled\\n", power_gpio);
+                }
+            }
+            
+            reset_gpio = of_get_named_gpio(np, "bt_reset", 0);
+            if (gpio_is_valid(reset_gpio)) {
+                if (devm_gpio_request(dev, reset_gpio, "bt_reset") == 0) {
+                    gpio_direction_output(reset_gpio, 1);
+                    msleep(50);
+                    printk(KERN_INFO "sunxi-btlpm: BT reset GPIO %d enabled\\n", reset_gpio);
+                }
+            }
+            
+            return 0;
+        }
+
+        static int sunxi_btlpm_remove(struct platform_device *pdev)
+        {
+            if (gpio_is_valid(power_gpio)) {
+                gpio_set_value(power_gpio, 0);
+            }
+            if (gpio_is_valid(reset_gpio)) {
+                gpio_set_value(reset_gpio, 0);
+            }
+            return 0;
+        }
+
+        static const struct of_device_id sunxi_btlpm_ids[] = {
+            { .compatible = "allwinner,sunxi-btlpm" },
+            { .compatible = "allwinner,xr829-bt" },
+            { }
+        };
+        MODULE_DEVICE_TABLE(of, sunxi_btlpm_ids);
+
+        static struct platform_driver sunxi_btlpm_driver = {
+            .probe = sunxi_btlpm_probe,
+            .remove = sunxi_btlpm_remove,
+            .driver = {
+                .name = "sunxi-btlpm",
+                .of_match_table = sunxi_btlpm_ids,
+            },
+        };
+
+        module_platform_driver(sunxi_btlpm_driver);
+
+        MODULE_LICENSE("GPL");
+        MODULE_AUTHOR("GitHub Actions Build");
+        MODULE_DESCRIPTION("Bluetooth Power Management for Allwinner A133P with XR829");
+        EOF
+
+    - name: Create Makefile
+      run: |
+        cat > sunxi-btlpm/Makefile << EOF
+        obj-m += sunxi-btlpm.o
+
+        KERNEL_SRC ?= \$(PWD)/../linux-sunxi
+        ARCH ?= arm64
+        CROSS_COMPILE ?= aarch64-linux-gnu-
+
+        all:
+        	\$(MAKE) -C \$(KERNEL_SRC) M=\$(PWD) modules
+
+        clean:
+        	\$(MAKE) -C \$(KERNEL_SRC) M=\$(PWD) clean
+
+        modules_install:
+        	\$(MAKE) -C \$(KERNEL_SRC) M=\$(PWD) modules_install
+        EOF
+
+    - name: Build kernel module
+      run: |
+        cd sunxi-btlpm
+        export ARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        make KERNEL_SRC=$(pwd)/../linux-sunxi
+
+    - name: Verify built module
+      run: |
+        cd sunxi-btlpm
+        file sunxi-btlpm.ko
+        ls -la sunxi-btlpm.ko
+
+    - name: Upload kernel module artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: sunxi-btlpm-module-${{ matrix.kernel-version }}-${{ matrix.arch }}
+        path: |
+          sunxi-btlpm/sunxi-btlpm.ko
+          sunxi-btlpm/*.mod
+          sunxi-btlpm/*.mod.c
+        retention-days: 30
