@@ -24,13 +24,7 @@ jobs:
         echo "Trying different kernel sources..."
         
         # Option 1: Armbian kernel với branch hợp lệ
-        git clone https://github.com/armbian/linux.git --depth=1 -b v5.19.13-sunxi64 linux-armbian ||
-        git clone https://github.com/armbian/linux.git --depth=1 -b orange-pi-5.19-rockchip linux-armbian ||
-        git clone https://github.com/armbian/linux.git --depth=1 -b sunxi-5.15 linux-armbian
-        
-        # Option 2: Linux sunxi mainline
-        git clone https://github.com/linux-sunxi/linux-sunxi.git --depth=1 -b sunxi-5.19 linux-sunxi ||
-        git clone https://github.com/linux-sunxi/linux-sunxi.git --depth=1 linux-sunxi
+        git clone https://github.com/linux-sunxi/linux-sunxi.git
 
     - name: List available branches
       run: |
