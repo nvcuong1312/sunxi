@@ -1,6 +1,6 @@
-name: Simple A133P Module Build
+name: Build sunxi-btlpm for A133P
 
-on: [workflow_dispatch]
+on: [workflow_dispatch, push]
 
 jobs:
   build:
@@ -9,35 +9,104 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     
-    - name: Setup
-      run: sudo apt-get install -y gcc-aarch64-linux-gnu git build-essential
-      
-    - name: Get kernel headers from device
+    - name: Setup environment
       run: |
-        # Giả lập kernel config từ A133P
-        wget https://raw.githubusercontent.com/armbian/build/main/config/kernel/linux-sunxi64-current.config -O .config
-        git clone https://github.com/armbian/linux.git -b sunxi-5.19 linux-armbian
+        sudo apt-get update
+        sudo apt-get install -y \
+          gcc-aarch64-linux-gnu \
+          git build-essential \
+          libssl-dev bc flex bison \
+          wget cpio
+
+    - name: Clone kernel with correct branches
+      run: |
+        # Thử các repository và branch khác nhau
+        echo "Trying different kernel sources..."
         
-    - name: Quick build
+        # Option 1: Armbian kernel với branch hợp lệ
+        git clone https://github.com/armbian/linux.git --depth=1 -b v5.19.13-sunxi64 linux-armbian ||
+        git clone https://github.com/armbian/linux.git --depth=1 -b orange-pi-5.19-rockchip linux-armbian ||
+        git clone https://github.com/armbian/linux.git --depth=1 -b sunxi-5.15 linux-armbian
+        
+        # Option 2: Linux sunxi mainline
+        git clone https://github.com/linux-sunxi/linux-sunxi.git --depth=1 -b sunxi-5.19 linux-sunxi ||
+        git clone https://github.com/linux-sunxi/linux-sunxi.git --depth=1 linux-sunxi
+
+    - name: List available branches
       run: |
-        mkdir -p module
-        # Tạo file source đơn giản
-        cat > module/sunxi_bt.c << 'EOF'
+        echo "=== Available branches in repositories ==="
+        cd linux-armbian && git branch -a | head -20 && cd ..
+        echo "---"
+        cd linux-sunxi && git branch -a | head -20 && cd ..
+
+    - name: Configure kernel
+      run: |
+        # Sử dụng repository nào clone thành công
+        if [ -d "linux-armbian" ]; then
+          KERNEL_DIR="linux-armbian"
+          cd $KERNEL_DIR
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          make defconfig
+          echo "CONFIG_BT=y" >> .config
+          echo "CONFIG_BT_BREDR=y" >> .config
+          echo "CONFIG_BT_LE=y" >> .config
+          echo "CONFIG_BT_HCIUART=y" >> .config
+          echo "CONFIG_BT_HCIUART_3WIRE=y" >> .config
+          make olddefconfig
+          cd ..
+        elif [ -d "linux-sunxi" ]; then
+          KERNEL_DIR="linux-sunxi"
+          cd $KERNEL_DIR
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          make defconfig
+          cd ..
+        else
+          echo "No kernel repository cloned successfully"
+          exit 1
+        fi
+
+    - name: Create sunxi-btlpm module source
+      run: |
+        mkdir -p sunxi-btlpm
+        cat > sunxi-btlpm/sunxi-btlpm.c << 'EOF'
         #include <linux/module.h>
+        #include <linux/kernel.h>
         #include <linux/init.h>
-        MODULE_LICENSE("GPL");
-        MODULE_AUTHOR("A133P");
-        static int __init bt_init(void) { printk("XR829 BT Loaded\n"); return 0; }
-        static void __exit bt_exit(void) { printk("XR829 BT Unloaded\n"); }
-        module_init(bt_init);
-        module_exit(bt_exit);
-        EOF
-        
-        echo "obj-m += sunxi_bt.o" > module/Makefile
-        make -C linux-armbian M=$PWD/module modules ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
-        
-    - name: Upload
-      uses: actions/upload-artifact@v4
-      with:
-        name: simple-bt-module
-        path: module/sunxi_bt.ko
+        #include <linux/gpio.h>
+        #include <linux/of_gpio.h>
+        #include <linux/delay.h>
+        #include <linux/platform_device.h>
+
+        #define DRIVER_NAME "sunxi-btlpm"
+        #define DRIVER_VERSION "1.0"
+
+        static int power_gpio = -1;
+        static int reset_gpio = -1;
+
+        static int sunxi_btlpm_probe(struct platform_device *pdev)
+        {
+            struct device *dev = &pdev->dev;
+            struct device_node *np = dev->of_node;
+            int ret;
+            
+            dev_info(dev, "Allwinner A133P XR829 Bluetooth Power Management\n");
+            
+            // Lấy GPIO power
+            power_gpio = of_get_named_gpio(np, "bt_power", 0);
+            if (gpio_is_valid(power_gpio)) {
+                ret = devm_gpio_request_one(dev, power_gpio, GPIOF_OUT_INIT_HIGH, "bt_power");
+                if (ret) {
+                    dev_warn(dev, "Failed to request power GPIO: %d\n", ret);
+                } else {
+                    dev_info(dev, "BT power GPIO %d enabled\n", power_gpio);
+                    msleep(100);
+                }
+            }
+            
+            // Lấy GPIO reset
+            reset_gpio = of_get_named_gpio(np, "bt_reset", 0);
+            if (gpio_is_valid(reset_gpio)) {
+                ret = devm_gpio_request_one(dev, reset_gpio, GPIOF_OUT_INIT_HIGH, "bt_reset");
+               
