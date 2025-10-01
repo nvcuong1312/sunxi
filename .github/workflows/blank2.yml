@@ -1,48 +1,46 @@
-name: Build sunxi-btlpm kernel module
+# .github/workflows/build-a133p.yml
+name: Build sunxi-btlpm for A133P
 
-on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
-  workflow_dispatch:  # Cho phép chạy thủ công
+on: [workflow_dispatch, push]
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        kernel-version: ["5.16.17", "5.15.89", "5.10.110"]
-        arch: [arm64]
     
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-
-    - name: Setup cross-compilation environment
+    - uses: actions/checkout@v4
+    
+    - name: Setup environment
       run: |
         sudo apt-get update
         sudo apt-get install -y \
           gcc-aarch64-linux-gnu \
           git build-essential \
           libssl-dev bc flex bison \
-          wget
+          wget cpio
 
-    - name: Download Allwinner kernel source
+    - name: Download kernel sources
       run: |
-        wget https://github.com/tinalinux/linux/archive/refs/heads/master.zip -O kernel.zip
-        unzip kernel.zip
-        mv linux-master linux-sunxi
+        # Option 1: Linux sunxi mainline
+        git clone https://github.com/linux-sunxi/linux-sunxi.git -b sunxi-5.19 linux-sunxi
+        
+        # Option 2: Armbian kernel
+        git clone https://github.com/armbian/linux.git -b orange-pi-5.19 armbian-kernel
+        
+        # Option 3: Mainline kernel
+        wget https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-5.19.17.tar.xz
+        tar -xf linux-5.19.17.tar.xz
 
-    - name: Configure kernel for A133P
+    - name: Configure kernel (sunxi)
       run: |
         cd linux-sunxi
         export ARCH=arm64
         export CROSS_COMPILE=aarch64-linux-gnu-
-        make sun50iw10p1_defconfig
-        make modules_prepare
+        make defconfig
+        make menuconfig <<< EOF
+        EOF
 
-    - name: Create sunxi-btlpm source
+    - name: Create sunxi-btlpm module
       run: |
         mkdir -p sunxi-btlpm
         cat > sunxi-btlpm/sunxi-btlpm.c << 'EOF'
@@ -53,78 +51,117 @@ jobs:
         #include <linux/of_gpio.h>
         #include <linux/delay.h>
         #include <linux/platform_device.h>
+        #include <linux/regulator/consumer.h>
 
-        static int power_gpio = -1;
-        static int reset_gpio = -1;
+        struct sunxi_bt_data {
+            int power_gpio;
+            int reset_gpio;
+            struct regulator *vcc_io;
+            struct regulator *vcc_bt;
+        };
 
-        static int sunxi_btlpm_probe(struct platform_device *pdev)
+        static struct sunxi_bt_data *bt_data;
+
+        static int sunxi_bt_probe(struct platform_device *pdev)
         {
             struct device *dev = &pdev->dev;
             struct device_node *np = dev->of_node;
-            
-            printk(KERN_INFO "sunxi-btlpm: Probing XR829 Bluetooth PM\\n");
-            
-            power_gpio = of_get_named_gpio(np, "bt_power", 0);
-            if (gpio_is_valid(power_gpio)) {
-                if (devm_gpio_request(dev, power_gpio, "bt_power") == 0) {
-                    gpio_direction_output(power_gpio, 1);
+            int ret;
+
+            bt_data = devm_kzalloc(dev, sizeof(*bt_data), GFP_KERNEL);
+            if (!bt_data)
+                return -ENOMEM;
+
+            // Get power GPIO
+            bt_data->power_gpio = of_get_named_gpio(np, "bt_power", 0);
+            if (gpio_is_valid(bt_data->power_gpio)) {
+                ret = devm_gpio_request(dev, bt_data->power_gpio, "bt_power");
+                if (!ret) {
+                    gpio_direction_output(bt_data->power_gpio, 1);
                     msleep(100);
-                    printk(KERN_INFO "sunxi-btlpm: BT power GPIO %d enabled\\n", power_gpio);
+                    dev_info(dev, "BT power GPIO %d enabled\n", bt_data->power_gpio);
                 }
             }
-            
-            reset_gpio = of_get_named_gpio(np, "bt_reset", 0);
-            if (gpio_is_valid(reset_gpio)) {
-                if (devm_gpio_request(dev, reset_gpio, "bt_reset") == 0) {
-                    gpio_direction_output(reset_gpio, 1);
+
+            // Get reset GPIO
+            bt_data->reset_gpio = of_get_named_gpio(np, "bt_reset", 0);
+            if (gpio_is_valid(bt_data->reset_gpio)) {
+                ret = devm_gpio_request(dev, bt_data->reset_gpio, "bt_reset");
+                if (!ret) {
+                    gpio_direction_output(bt_data->reset_gpio, 1);
                     msleep(50);
-                    printk(KERN_INFO "sunxi-btlpm: BT reset GPIO %d enabled\\n", reset_gpio);
+                    dev_info(dev, "BT reset GPIO %d enabled\n", bt_data->reset_gpio);
                 }
             }
-            
+
+            // Get regulators
+            bt_data->vcc_io = devm_regulator_get(dev, "vcc-io");
+            if (!IS_ERR(bt_data->vcc_io)) {
+                regulator_set_voltage(bt_data->vcc_io, 1800000, 1800000);
+                ret = regulator_enable(bt_data->vcc_io);
+                if (ret)
+                    dev_warn(dev, "Failed to enable VCC-IO regulator\n");
+            }
+
+            bt_data->vcc_bt = devm_regulator_get(dev, "vcc-bt");
+            if (!IS_ERR(bt_data->vcc_bt)) {
+                regulator_set_voltage(bt_data->vcc_bt, 3300000, 3300000);
+                ret = regulator_enable(bt_data->vcc_bt);
+                if (ret)
+                    dev_warn(dev, "Failed to enable VCC-BT regulator\n");
+            }
+
+            dev_info(dev, "Allwinner A133P XR829 Bluetooth PM loaded\n");
             return 0;
         }
 
-        static int sunxi_btlpm_remove(struct platform_device *pdev)
+        static int sunxi_bt_remove(struct platform_device *pdev)
         {
-            if (gpio_is_valid(power_gpio)) {
-                gpio_set_value(power_gpio, 0);
-            }
-            if (gpio_is_valid(reset_gpio)) {
-                gpio_set_value(reset_gpio, 0);
+            if (bt_data) {
+                if (gpio_is_valid(bt_data->power_gpio))
+                    gpio_set_value(bt_data->power_gpio, 0);
+                if (gpio_is_valid(bt_data->reset_gpio))
+                    gpio_set_value(bt_data->reset_gpio, 0);
+                    
+                if (!IS_ERR(bt_data->vcc_io))
+                    regulator_disable(bt_data->vcc_io);
+                if (!IS_ERR(bt_data->vcc_bt))
+                    regulator_disable(bt_data->vcc_bt);
             }
             return 0;
         }
 
-        static const struct of_device_id sunxi_btlpm_ids[] = {
+        static const struct of_device_id sunxi_bt_match[] = {
             { .compatible = "allwinner,sunxi-btlpm" },
             { .compatible = "allwinner,xr829-bt" },
+            { .compatible = "allwinner,sun50i-a133p-bt" },
             { }
         };
-        MODULE_DEVICE_TABLE(of, sunxi_btlpm_ids);
+        MODULE_DEVICE_TABLE(of, sunxi_bt_match);
 
-        static struct platform_driver sunxi_btlpm_driver = {
-            .probe = sunxi_btlpm_probe,
-            .remove = sunxi_btlpm_remove,
+        static struct platform_driver sunxi_bt_driver = {
+            .probe = sunxi_bt_probe,
+            .remove = sunxi_bt_remove,
             .driver = {
                 .name = "sunxi-btlpm",
-                .of_match_table = sunxi_btlpm_ids,
+                .of_match_table = sunxi_bt_match,
             },
         };
 
-        module_platform_driver(sunxi_btlpm_driver);
+        module_platform_driver(sunxi_bt_driver);
 
         MODULE_LICENSE("GPL");
-        MODULE_AUTHOR("GitHub Actions Build");
-        MODULE_DESCRIPTION("Bluetooth Power Management for Allwinner A133P with XR829");
+        MODULE_AUTHOR("GitHub Actions");
+        MODULE_DESCRIPTION("Bluetooth power management for Allwinner A133P XR829");
+        MODULE_VERSION("1.0");
         EOF
 
     - name: Create Makefile
       run: |
-        cat > sunxi-btlpm/Makefile << EOF
+        cat > sunxi-btlpm/Makefile << 'EOF'
         obj-m += sunxi-btlpm.o
 
-        KERNEL_SRC ?= \$(PWD)/../linux-sunxi
+        KERNEL_SRC ?= \$(PWD)/linux-sunxi
         ARCH ?= arm64
         CROSS_COMPILE ?= aarch64-linux-gnu-
 
@@ -134,29 +171,26 @@ jobs:
         clean:
         	\$(MAKE) -C \$(KERNEL_SRC) M=\$(PWD) clean
 
-        modules_install:
-        	\$(MAKE) -C \$(KERNEL_SRC) M=\$(PWD) modules_install
+        help:
+        	\$(MAKE) -C \$(KERNEL_SRC) M=\$(PWD) help
         EOF
 
-    - name: Build kernel module
+    - name: Build the module
       run: |
         cd sunxi-btlpm
-        export ARCH=arm64
-        export CROSS_COMPILE=aarch64-linux-gnu-
-        make KERNEL_SRC=$(pwd)/../linux-sunxi
+        make KERNEL_SRC=$(pwd)/../linux-sunxi ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
 
-    - name: Verify built module
+    - name: Check module info
       run: |
         cd sunxi-btlpm
         file sunxi-btlpm.ko
-        ls -la sunxi-btlpm.ko
+        aarch64-linux-gnu-objdump -h sunxi-btlpm.ko | head -20
 
-    - name: Upload kernel module artifact
+    - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: sunxi-btlpm-module-${{ matrix.kernel-version }}-${{ matrix.arch }}
+        name: sunxi-btlpm-module
         path: |
           sunxi-btlpm/sunxi-btlpm.ko
-          sunxi-btlpm/*.mod
-          sunxi-btlpm/*.mod.c
-        retention-days: 30
+          sunxi-btlpm/Makefile
+          sunxi-btlpm/sunxi-btlpm.c
